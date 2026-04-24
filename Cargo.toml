@@ -4,7 +4,7 @@
 
 [package]
 name = "sqlx-ra-tls"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "sqlx::postgres driver extension with RA-TLS attestation verification for dstack TEE databases"
@@ -32,6 +32,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 jsonwebtoken = "10"
 base64 = "0.22"
 hex = "0.4"
+# Local DCAP quote verification — drives `DcapVerifier`.
+# 0.4.0 ships pure-Rust verification (`ring` crypto provider) with the
+# audited `default-x509` cert parser, plus PCCS collateral fetch via
+# `reqwest`. Same crate dstack-verifier consumes.
+dcap-qvl = { version = "0.4.0", default-features = false, features = ["std", "report", "ring", "default-x509"] }
 parity-scale-codec = { version = "3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -42,6 +47,16 @@ webpki-roots = "1"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 rcgen = "0.13"
+# Used by `tests/dcap_roundtrip.rs` to compute a `now` inside the
+# fixture collateral's validity window. Default features keep the
+# dep small (no clock backend pulled in here — RFC3339 parse only).
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# Used by `tests/dcap_roundtrip.rs` to read CRL `thisUpdate` /
+# `nextUpdate` bounds when sizing the fixture validity window.
+# Pinned to versions matching dcap-qvl 0.4.0's transitive
+# resolution so we re-use the already-built crates.
+der = { version = "0.7", features = ["alloc"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 
 [features]
 default = []

@@ -11,7 +11,7 @@ When your application opens a connection to the sidecar, `sqlx-ra-tls`:
 1. Fetches a short-lived, TDX-attested client certificate from the local dstack guest agent.
 2. Performs an RA-TLS handshake with the server, presenting that client certificate for mutual authentication.
 3. Extracts the TDX attestation quote from the server's self-signed RA-TLS certificate.
-4. Submits the quote to [Intel Trust Authority](https://portal.trustauthority.intel.com) (or any custom verifier) and validates the response: debug mode off, TCB status acceptable, MRTD in allowlist when configured.
+4. Verifies the quote — by default, **locally** via [`dcap-qvl`](https://crates.io/crates/dcap-qvl) (no Intel account required). Validates: TDX root chain up to Intel's CA, debug mode off, TCB status acceptable, and MRTD in allowlist when configured.
 5. Only then hands a `PgConnectOptions` back to sqlx so the real connection pool can open.
 
 If verification fails at any step, `pg_connect_opts_ra_tls` returns an error and no SQL is ever issued.
@@ -20,7 +20,7 @@ If verification fails at any step, `pg_connect_opts_ra_tls` returns an error and
 
 ```toml
 [dependencies]
-sqlx-ra-tls = "0.1"
+sqlx-ra-tls = "0.2"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls"] }
 ```
 
@@ -28,18 +28,20 @@ Requires Rust >= 1.92 (for the `edition2024` dependencies pulled in transitively
 
 ## Usage
 
-### Production (Intel Trust Authority)
+### Production (default: local DCAP verification)
 
 ```rust
 use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
-use sqlx_ra_tls::{pg_connect_opts_ra_tls, IntelApiVerifier, RaTlsOptions};
+use sqlx_ra_tls::{pg_connect_opts_ra_tls, DcapVerifier, RaTlsOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let api_key = std::env::var("INTEL_TRUST_AUTHORITY_API_KEY")?;
-    let verifier = Arc::new(IntelApiVerifier::new(api_key));
+    // No Intel account required. `DcapVerifier::new()` uses Intel's
+    // public PCS for platform collateral; pass `with_pccs_url(...)`
+    // to point at the Phala mirror or a self-hosted PCCS.
+    let verifier = Arc::new(DcapVerifier::new());
 
     let dsn = std::env::var("DATABASE_URL")?;
     let opts = pg_connect_opts_ra_tls(
@@ -61,6 +63,31 @@ async fn main() -> anyhow::Result<()> {
     println!("got {one}");
     Ok(())
 }
+```
+
+`DcapVerifier` walks the quote's PCK certificate chain up to Intel's
+root CA (embedded in the library). Platform-specific collateral —
+TCB info, QE identity, CRLs — is fetched from a PCCS endpoint
+(default: `https://api.trustedservices.intel.com`). No Intel
+Trust Authority API key, no JWT, no per-connection HTTP round trip
+to a third-party verifier service.
+
+### Advanced: Intel Trust Authority opt-in
+
+`IntelApiVerifier` is retained for callers who specifically want
+Intel-signed JWT claims — e.g. compliance setups that require a
+third-party attestation token signed by Intel. It requires an Intel
+Trust Authority account and burns one Intel API call per verifier
+invocation. For everyone else, prefer `DcapVerifier` — same claim
+mapping, no account requirement, fewer moving parts.
+
+```rust
+use std::sync::Arc;
+use sqlx_ra_tls::IntelApiVerifier;
+
+let api_key = std::env::var("INTEL_TRUST_AUTHORITY_API_KEY")?;
+let verifier = Arc::new(IntelApiVerifier::new(api_key));
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `DATABASE_URL` format:
@@ -122,7 +149,7 @@ pub struct RaTlsOptions {
 
 ## Custom verifier
 
-Implement the [`RaTlsVerifier`](./src/types.rs) trait to plug a local DCAP verifier, a caching proxy, or anything else in place of Intel Trust Authority:
+Implement the [`RaTlsVerifier`](./src/types.rs) trait to plug a caching proxy, a different TEE family (AMD SEV-SNP, Nitro), or any other backend in place of `DcapVerifier`:
 
 ```rust
 use async_trait::async_trait;
@@ -154,7 +181,7 @@ In a standard TLS handshake, the server's certificate is signed by a trusted CA.
 
 The TLS public key is bound to the quote via the `REPORTDATA` field, preventing a man-in-the-middle from substituting their own certificate.
 
-`sqlx-ra-tls` parses the Phala RA-TLS extensions (OID `1.3.6.1.4.1.62397.1.1` and the newer `1.3.6.1.4.1.62397.1.8` SCALE-encoded envelope) and delegates quote verification to the verifier you inject.
+`sqlx-ra-tls` parses the Phala RA-TLS extensions (OID `1.3.6.1.4.1.62397.1.1` and the newer `1.3.6.1.4.1.62397.1.8` SCALE-encoded envelope) and delegates quote verification to the verifier you inject. The default `DcapVerifier` walks the PCK chain locally — same primitive `dstack-verifier` uses, no Intel account required.
 
 See also: [`docs/architecture/monitoring-deployment.md`](../../docs/architecture/monitoring-deployment.md) for how the monitoring hub consumes this crate, and [`docs/plans/monitoring-hub-deployment.md`](../../docs/plans/monitoring-hub-deployment.md) for the deployment contract.
 
@@ -164,13 +191,13 @@ See also: [`docs/architecture/monitoring-deployment.md`](../../docs/architecture
 - **Never set `allow_debug_mode = true`** in production. Debug TDs can be inspected and have no confidentiality.
 - **`allow_simulator = true`** disables server-side quote verification. Never use in production.
 - **TOCTOU caveat.** sqlx 0.8 does not expose a ServerCertVerifier hook, so we verify the server's attested identity via a dedicated pre-flight probe before handing options to sqlx. The probe captures the server cert fingerprint — use [`sqlx_ra_tls::verify_server`] in a `PgPoolOptions::before_acquire` callback to re-verify periodically if your threat model requires detection of mid-pool CVM substitution.
-- Intel Trust Authority is a third-party service. Attestation failures will prevent new connections from being established. Plan for retries and connection pool warmup.
+- **PCCS availability.** `DcapVerifier` fetches platform certs from a PCCS (Intel's public endpoint by default, or any mirror you configure). Cold-starts for an unseen FMSPC fail until PCCS returns — much softer than the v0.1 Intel-TA hard dependency, but still a network dependency. For air-gapped deployments, fetch + cache `QuoteCollateralV3` out of band and call `DcapVerifier::verify_with_collateral` directly.
+- **Intel Trust Authority** (when using `IntelApiVerifier`) is a third-party hosted service. Attestation failures will prevent new connections from being established. Plan for retries and connection pool warmup.
 
 ## Roadmap
 
-- [ ] v0.2 — cached verifier wrapper so Intel Trust Authority is only consulted once per server identity per TTL.
-- [ ] v0.3 — optional `sqlx::postgres` `before_acquire` helper that runs `verify_server` automatically on pool check-out.
-- [ ] v0.4 — local DCAP binary verifier for air-gapped deployments.
+- [ ] v0.3 — cached verifier wrapper so collateral fetches are only run once per FMSPC per TTL.
+- [ ] v0.4 — optional `sqlx::postgres` `before_acquire` helper that runs `verify_server` automatically on pool check-out.
 
 ## License
 

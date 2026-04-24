@@ -17,4 +17,4 @@ pub use connector::{pg_connect_opts_ra_tls, verify_server, RaTlsOptions, Verifie
 pub use dstack::{get_dstack_client_cert, DstackClientCert, DSTACK_SIMULATOR_ENV};
 pub use error::Error;
 pub use types::{RaTlsVerifier, VerificationResult, VerifyError, VerifyOptions};
-pub use verifiers::{IntelApiVerifier, NoopVerifier};
+pub use verifiers::{DcapVerifier, IntelApiVerifier, NoopVerifier, DEFAULT_PCCS_URL};
