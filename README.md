@@ -6,21 +6,25 @@ Rust peer of [psycopg-ra-tls](https://github.com/teesql/psycopg-ra-tls) (Python)
 
 ## What it does
 
-When your application opens a connection to the sidecar, `sqlx-ra-tls`:
+`sqlx-ra-tls` spawns a tiny in-process TCP forwarder at `127.0.0.1:<ephemeral>`. Every connection sqlx opens goes through this forwarder, which:
 
 1. Fetches a short-lived, TDX-attested client certificate from the local dstack guest agent.
-2. Performs an RA-TLS handshake with the server, presenting that client certificate for mutual authentication.
+2. Opens a raw TLS connection to the sidecar — no postgres `SSLRequest` preamble — presenting the client certificate for mutual authentication.
 3. Extracts the TDX attestation quote from the server's self-signed RA-TLS certificate.
 4. Verifies the quote — by default, **locally** via [`dcap-qvl`](https://crates.io/crates/dcap-qvl) (no Intel account required). Validates: TDX root chain up to Intel's CA, debug mode off, TCB status acceptable, and MRTD in allowlist when configured.
-5. Only then hands a `PgConnectOptions` back to sqlx so the real connection pool can open.
+5. Only then bridges bytes between sqlx and the attested TLS channel.
 
-If verification fails at any step, `pg_connect_opts_ra_tls` returns an error and no SQL is ever issued.
+If verification fails at any step the forwarder closes the local connection and sqlx surfaces it as an ordinary connection error. No SQL is ever issued to an unattested server.
+
+### Why a forwarder
+
+sqlx 0.8 runs its own TLS handshake starting with the postgres `SSLRequest` 8-byte preamble before the TLS ClientHello. A dstack gateway in TLS-passthrough mode routes by parsing the first bytes as a TLS ClientHello to extract SNI; the `SSLRequest` preamble makes SNI extraction fail and the connection is closed. Moving TLS out of sqlx into the forwarder lets us send a raw ClientHello as the first bytes on the wire — the gateway sees valid SNI, routes correctly, and the sidecar's mutual-RA-TLS handshake succeeds end-to-end. See the `forwarder` module doc comment for the full rationale.
 
 ## Install
 
 ```toml
 [dependencies]
-sqlx-ra-tls = "0.2"
+sqlx-ra-tls = "0.3"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls"] }
 ```
 

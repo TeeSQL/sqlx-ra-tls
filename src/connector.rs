@@ -1,22 +1,22 @@
-//! RA-TLS connector glue for `sqlx::postgres`.
+//! sqlx RA-TLS connector for dstack TEE Postgres sidecars.
 //!
-//! sqlx 0.8 does not expose a hook for installing a custom
-//! `rustls::ClientConfig` or a custom `rustls::client::ServerCertVerifier`.
-//! Instead, it consumes a flat [`PgConnectOptions`] and builds its own
-//! rustls config internally. That makes an in-handshake quote check
-//! impossible without forking the crate.
+//! sqlx 0.8 runs its own TLS handshake as part of every `PgConnection::connect`
+//! using a flat [`PgConnectOptions`]. There's no hook to install a custom
+//! `rustls::ClientConfig` or swap in a pre-wrapped stream, so sqlx's TLS
+//! always starts with the postgres `SSLRequest` 8-byte preamble. Against a
+//! dstack-gateway-routed sidecar, that preamble breaks the gateway's SNI
+//! extraction (first byte `0x00` ≠ TLS handshake record type `0x16`) and the
+//! connection is closed before any cert exchange happens.
 //!
-//! The mitigation used by this SDK — and by the Python/TypeScript peers
-//! — is to run a dedicated pre-flight TLS probe against the target
-//! server, presenting the dstack-issued client cert and extracting the
-//! TDX quote from the server's leaf certificate. The returned
-//! [`PgConnectOptions`] embed the same client cert/key so sqlx sends
-//! them again during its own handshake. This preserves mutual RA-TLS
-//! semantics: the client identity is proven on every connection, and
-//! the server identity has been attested before any SQL is issued.
+//! To keep mutual RA-TLS working end-to-end through the gateway, we run TLS
+//! *outside* of sqlx: an in-process [`RaTlsForwarder`](crate::RaTlsForwarder)
+//! listens on `127.0.0.1:<ephemeral>`, terminates mutual RA-TLS against the
+//! cluster on each accept, and hands sqlx a plain-TCP local endpoint with
+//! `sslmode=disable`. See `forwarder.rs` for the full rationale.
 //!
-//! The probe also records the server cert's SHA-256 fingerprint so
-//! callers can re-probe per acquire and detect mid-pool substitutions.
+//! [`pg_connect_opts_ra_tls`] is still the one-line entry point — it starts
+//! the forwarder and returns `PgConnectOptions` already pointed at it, so
+//! callers don't have to know the details.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +32,7 @@ use tokio_rustls::TlsConnector;
 use crate::cert::extract_tdx_quote;
 use crate::dstack::{self, DstackClientCert};
 use crate::error::Error;
+use crate::forwarder::RaTlsForwarder;
 use crate::types::{RaTlsVerifier, VerifyOptions};
 
 /// Options controlling how RA-TLS verification is applied on each connect.
@@ -73,25 +74,33 @@ const TEESQL_USERNAMES: &[&str] = &["teesql_read", "teesql_readwrite"];
 /// Length of the 32-byte cluster-secret expressed as lowercase hex.
 const CLUSTER_SECRET_HEX_LEN: usize = 64;
 
-/// Maximum duration we wait for the TLS handshake + first flight. The
-/// probe is a one-shot TCP+TLS handshake so this budget is generous.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum duration we wait for a single TLS handshake (either the one-shot
+/// probe or a forwarder accept's upstream connect). TLS over the dstack
+/// gateway typically completes in well under a second; 15s is generous.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Build a [`PgConnectOptions`] for a teesql-sidecar target and verify the
-/// server's TDX quote before returning.
-///
-/// This is the primary entry point the README recommends. The returned
-/// options are ready to be passed to `PgPoolOptions::new().connect_with`.
+/// Build a [`PgConnectOptions`] for a teesql-sidecar target, starting an
+/// in-process [`RaTlsForwarder`](crate::RaTlsForwarder) that terminates
+/// mutual RA-TLS and bridges bytes to the cluster. The returned options
+/// point at the forwarder's local address with `sslmode=disable`, and are
+/// ready to pass to `PgPoolOptions::new().connect_with(opts)`.
 ///
 /// The flow:
 /// 1. Parse the DSN; enforce `teesql_read` / `teesql_readwrite` and a 64-char
 ///    hex cluster secret.
 /// 2. Fetch a short-lived dstack client cert (or reuse the override).
-/// 3. Probe the server with an RA-TLS handshake, extract the quote, and
-///    run it through `verifier`.
-/// 4. Return options configured for `sslmode=require` plus the client
-///    cert/key inlined as PEM — so the same attested identity is
-///    presented again during sqlx's own handshake.
+/// 3. Spawn an [`RaTlsForwarder`](crate::RaTlsForwarder) bound to
+///    `127.0.0.1:<ephemeral>` that opens mutual RA-TLS to the cluster on
+///    every accept and bridges bytes.
+/// 4. Return `PgConnectOptions` with host/port replaced by the forwarder's
+///    local address and `ssl_mode=disable`, preserving user/password/db
+///    from the original DSN.
+///
+/// The forwarder is leaked for the process lifetime — typical teesql
+/// clients hold a single `PgPool` for as long as the service runs, which
+/// outlives any explicit handle anyway. Programs that need a tighter
+/// lifecycle should call [`RaTlsForwarder::start`](crate::RaTlsForwarder::start)
+/// directly and compose the options by hand.
 pub async fn pg_connect_opts_ra_tls(
     dsn: &str,
     verifier: Arc<dyn RaTlsVerifier>,
@@ -106,41 +115,50 @@ pub async fn pg_connect_opts_ra_tls(
     // callers do not spend an RTT discovering a configuration error.
     validate_dsn(&base_opts, dsn)?;
 
-    // Fetch the client cert. This is mandatory — see MissingDstackSocket
-    // docs in [`crate::Error`]. We keep the PEMs as `String`/`Vec<u8>` so
-    // they can be inlined into PgConnectOptions verbatim.
+    // Fetch the client cert. Mandatory — the cluster's sidecar requires a
+    // TDX-attested client cert during the TLS handshake; see
+    // `crate::Error::MissingDstackSocket` for the simulator guidance.
     let client_cert = match opts.client_cert_override.clone() {
         Some(cert) => cert,
         None => dstack::get_dstack_client_cert().await?,
     };
 
-    // Run the server verification probe. On success the options become a
-    // one-shot proof-of-life; sqlx still re-handshakes on every physical
-    // connection, and the caller may run [`verify_server`] again to
-    // catch long-lived CVM replacement.
-    let _verified = verify_server(
-        base_opts.get_host(),
-        base_opts.get_port(),
-        &client_cert,
-        &*verifier,
-        &opts,
+    // Spawn the forwarder and return options pointing at it. The forwarder
+    // owns a background accept loop that terminates mutual RA-TLS against
+    // the target cluster on every connection.
+    let target_host = base_opts.get_host().to_string();
+    let target_port = base_opts.get_port();
+    let forwarder = RaTlsForwarder::start(
+        target_host,
+        target_port,
+        client_cert,
+        verifier,
+        opts,
     )
     .await?;
+    let local_addr = forwarder.local_addr;
+    // Leak — see function docs. Tighter-lifetime callers should use
+    // `RaTlsForwarder::start` directly.
+    let _: &'static RaTlsForwarder = Box::leak(Box::new(forwarder));
 
     let verified_opts = base_opts
-        .ssl_mode(PgSslMode::Require)
-        .ssl_client_cert_from_pem(client_cert.chain_pem.as_bytes())
-        .ssl_client_key_from_pem(client_cert.key_pem.as_bytes());
+        .host(&local_addr.ip().to_string())
+        .port(local_addr.port())
+        .ssl_mode(PgSslMode::Disable);
 
     Ok(verified_opts)
 }
 
-/// Lower-level helper exported for re-verification. Opens a TLS
-/// connection to `(host, port)` presenting `client_cert` and runs
-/// `verifier` over the quote in the server's leaf certificate.
+/// Lower-level one-shot RA-TLS probe. Opens a raw TLS connection to
+/// `(host, port)` presenting `client_cert`, verifies the server's TDX
+/// quote, and returns the captured leaf cert + fingerprint.
 ///
-/// Returns [`VerifiedServer`] with the cert fingerprint so the caller
-/// can short-circuit a verifier round-trip for the same identity.
+/// Use this for standalone health checks or CVM-replacement detection.
+/// It deliberately does *not* send the postgres `SSLRequest` preamble —
+/// the connection target is expected to speak TLS directly (through a
+/// dstack gateway in passthrough mode, or directly to a sidecar's :5433
+/// RA-TLS listener). For sqlx pool connections, use [`pg_connect_opts_ra_tls`]
+/// which wires up an [`RaTlsForwarder`](crate::RaTlsForwarder).
 pub async fn verify_server(
     host: &str,
     port: u16,
@@ -148,20 +166,8 @@ pub async fn verify_server(
     verifier: &dyn RaTlsVerifier,
     opts: &RaTlsOptions,
 ) -> Result<VerifiedServer, Error> {
-    let provider = Arc::new(default_crypto_provider());
-
-    let (client_key, client_chain) = client_cert.to_rustls()?;
-
-    let capture = Arc::new(LeafCaptureVerifier::new(provider.clone()));
-
-    let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(Error::Tls)?
-        .dangerous()
-        .with_custom_certificate_verifier(capture.clone())
-        .with_client_auth_cert(client_chain, client_key)
-        .map_err(Error::Tls)?;
-
+    let capture = Arc::new(LeafCaptureVerifier::new(Arc::new(default_crypto_provider())));
+    let client_config = build_ra_tls_client_config(client_cert, Arc::clone(&capture))?;
     let connector = TlsConnector::from(Arc::new(client_config));
 
     // We deliberately ignore DNS SANs: RA-TLS certs are self-signed and
@@ -170,17 +176,11 @@ pub async fn verify_server(
     let server_name = ServerName::try_from(host.to_string())
         .unwrap_or(ServerName::try_from("teesql.invalid".to_string()).expect("literal parses"));
 
-    // Postgres speaks StartTLS: we have to send an SSLRequest frame and
-    // read the single-byte 'S' reply before rustls can drive the TLS
-    // handshake. Doing this ourselves keeps the probe surface small — a
-    // TCP connect, one read-write round, then a TLS handshake — and
-    // mirrors the sidecar's expected client flow.
     let tcp = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(format!("{host}:{port}")))
         .await
         .map_err(|_| Error::Other("TCP connect timed out".into()))??;
 
     tcp.set_nodelay(true)?;
-    let tcp = start_postgres_tls(tcp).await?;
 
     let tls = tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp))
         .await
@@ -193,7 +193,6 @@ pub async fn verify_server(
     let (_io, _session) = tls.into_inner();
     drop(_io);
 
-    // Pull the captured leaf certificate out of the verifier.
     let leaf_cert_der = capture
         .leaf()
         .ok_or_else(|| Error::Other("server presented no leaf certificate".into()))?;
@@ -236,7 +235,31 @@ pub async fn verify_server(
     })
 }
 
-fn default_crypto_provider() -> CryptoProvider {
+/// Build a rustls `ClientConfig` that:
+/// - presents `client_cert` during the handshake;
+/// - captures the server's leaf cert via `capture` for post-handshake quote
+///   extraction;
+/// - accepts any server chain (real verification is DCAP on the captured
+///   quote, not PKI).
+///
+/// `pub(crate)` so [`RaTlsForwarder`](crate::RaTlsForwarder) can build the
+/// same config without duplicating the safety dance.
+pub(crate) fn build_ra_tls_client_config(
+    client_cert: &DstackClientCert,
+    capture: Arc<LeafCaptureVerifier>,
+) -> Result<rustls::ClientConfig, Error> {
+    let (client_key, client_chain) = client_cert.to_rustls()?;
+    let provider = Arc::new(default_crypto_provider());
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(Error::Tls)?
+        .dangerous()
+        .with_custom_certificate_verifier(capture)
+        .with_client_auth_cert(client_chain, client_key)
+        .map_err(Error::Tls)
+}
+
+pub(crate) fn default_crypto_provider() -> CryptoProvider {
     // We depend on the `ring` feature of rustls; if a caller has also
     // installed a process-wide default provider, prefer that to avoid
     // surprises. Otherwise fall back to ring directly.
@@ -264,29 +287,6 @@ fn sha256_hex(data: &[u8]) -> String {
 
     let digest = hasher.hash(data);
     hex::encode(digest.as_ref())
-}
-
-/// Send the Postgres SSLRequest packet and wait for the server's single-byte
-/// response. Returns the socket if TLS may proceed; bails otherwise.
-async fn start_postgres_tls(mut tcp: TcpStream) -> Result<TcpStream, Error> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Frame: 8 bytes. length=8, code=80877103 (0x04D2162F).
-    const SSL_REQUEST: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F];
-    tcp.write_all(&SSL_REQUEST).await?;
-    tcp.flush().await?;
-
-    let mut reply = [0u8; 1];
-    tcp.read_exact(&mut reply).await?;
-    match reply[0] {
-        b'S' => Ok(tcp),
-        b'N' => Err(Error::Other(
-            "server refused TLS during SSLRequest handshake".into(),
-        )),
-        other => Err(Error::Other(format!(
-            "unexpected SSLRequest reply byte: 0x{other:02x}"
-        ))),
-    }
 }
 
 fn validate_dsn(opts: &PgConnectOptions, raw_dsn: &str) -> Result<(), Error> {
@@ -332,21 +332,24 @@ fn extract_password_from_dsn(dsn: &str) -> Result<String, Error> {
 /// rustls ServerCertVerifier that captures the server's leaf certificate
 /// into a shared slot and always claims success. We run real verification
 /// (quote extraction + attestation) after the handshake completes.
+///
+/// `pub(crate)` so [`RaTlsForwarder`](crate::RaTlsForwarder) can share
+/// the same capture/verifier dance on every forwarded accept.
 #[derive(Debug)]
-struct LeafCaptureVerifier {
+pub(crate) struct LeafCaptureVerifier {
     leaf: std::sync::Mutex<Option<Vec<u8>>>,
     provider: Arc<CryptoProvider>,
 }
 
 impl LeafCaptureVerifier {
-    fn new(provider: Arc<CryptoProvider>) -> Self {
+    pub(crate) fn new(provider: Arc<CryptoProvider>) -> Self {
         Self {
             leaf: std::sync::Mutex::new(None),
             provider,
         }
     }
 
-    fn leaf(&self) -> Option<Vec<u8>> {
+    pub(crate) fn leaf(&self) -> Option<Vec<u8>> {
         self.leaf.lock().expect("leaf mutex poisoned").clone()
     }
 }
