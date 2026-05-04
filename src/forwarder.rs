@@ -217,8 +217,13 @@ async fn handle_connection(
                 allowed_mr_td: opts.allowed_mrtds.clone(),
                 allow_debug_mode: opts.allow_debug_mode,
             };
+            // Bind the quote to the leaf cert's public key. Without this
+            // a captured quote could be replayed inside any attacker-
+            // issued cert and the forwarder would happily proxy traffic
+            // to the attacker's endpoint. See
+            // `RaTlsVerifier::verify_with_pubkey`.
             let result = verifier
-                .verify(&q, &vopts)
+                .verify_with_pubkey(&q, &vopts, &leaf_der)
                 .await
                 .map_err(Error::VerificationFailed)?;
             let short_mr = result.mr_td.chars().take(16).collect::<String>();

@@ -22,7 +22,10 @@ use dcap_qvl::quote::Report;
 use dcap_qvl::verify::{self, VerifiedReport};
 use dcap_qvl::QuoteCollateralV3;
 
-use crate::types::{RaTlsVerifier, VerificationResult, VerifyError, VerifyOptions};
+use crate::types::{
+    expected_report_data_for_pubkey, extract_spki_der, RaTlsVerifier, VerificationResult,
+    VerifyError, VerifyOptions,
+};
 
 /// Default PCCS endpoint — Intel's public Provisioning Certification
 /// Service. Override with [`DcapVerifier::with_pccs_url`] if you operate
@@ -135,6 +138,47 @@ impl RaTlsVerifier for DcapVerifier {
         options: &VerifyOptions,
     ) -> Result<VerificationResult, VerifyError> {
         let verified = self.verify_inner(quote).await?;
+        apply_policy(&verified, options)
+    }
+
+    /// DCAP-aware override of the default trait implementation. Reuses
+    /// the single PCCS-fetch + DCAP verification call that `verify` does,
+    /// then asserts the cert-pubkey binding before returning.
+    ///
+    /// The check is intentionally written inline (rather than calling the
+    /// shared default) so the security-critical binding step is visible
+    /// at this site — future readers grepping for `report_data` find the
+    /// guarantee in the verifier itself, not buried in trait machinery.
+    async fn verify_with_pubkey(
+        &self,
+        quote: &[u8],
+        options: &VerifyOptions,
+        cert_der: &[u8],
+    ) -> Result<VerificationResult, VerifyError> {
+        let verified = self.verify_inner(quote).await?;
+
+        // Pull the 64-byte report_data out of the already-DCAP-verified
+        // report. Avoids re-parsing the quote a second time.
+        let report_data = match &verified.report {
+            Report::TD10(r) => r.report_data,
+            Report::TD15(r) => r.base.report_data,
+            Report::SgxEnclave(_) => {
+                return Err(VerifyError::Service(
+                    "expected a TDX quote, got an SGX enclave report".into(),
+                ))
+            }
+        };
+
+        // Hash the cert's SubjectPublicKeyInfo and require equality with
+        // the quote's report_data. Mirrors
+        // `dstack_attest::Attestation::verify_with_ra_pubkey`
+        // (`open-source/dstack/dstack-attest/src/attestation.rs:622-632`).
+        let spki_der = extract_spki_der(cert_der)?;
+        let expected = expected_report_data_for_pubkey(&spki_der);
+        if expected != report_data {
+            return Err(VerifyError::PubkeyMismatch);
+        }
+
         apply_policy(&verified, options)
     }
 }

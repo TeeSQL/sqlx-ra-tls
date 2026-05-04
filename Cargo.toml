@@ -4,7 +4,7 @@
 
 [package]
 name = "sqlx-ra-tls"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "sqlx::postgres driver extension with RA-TLS attestation verification for dstack TEE databases"
@@ -38,6 +38,10 @@ hex = "0.4"
 # `reqwest`. Same crate dstack-verifier consumes.
 dcap-qvl = { version = "0.4.0", default-features = false, features = ["std", "report", "ring", "default-x509"] }
 parity-scale-codec = { version = "3", default-features = false, features = ["std"] }
+# SHA-512 used for the RA-TLS quote ↔ cert pubkey binding
+# (`types::expected_report_data_for_pubkey`). Mirrors
+# `dstack_attest::QuoteContentType::RaTlsCert.to_report_data`.
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"

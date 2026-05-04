@@ -42,6 +42,23 @@ impl RaTlsVerifier for NoopVerifier {
             is_debug_mode: false,
         })
     }
+
+    /// Dev-only override: accept any quote ↔ cert pairing without
+    /// running the binding check. The default trait impl would parse the
+    /// quote and the cert and compare hashes; in dev/simulator paths the
+    /// quote is often an empty placeholder and the cert is a self-signed
+    /// rcgen cert with no `report_data` baked in, so the binding check
+    /// would always fail. The constructor's loud `log::warn!` is the
+    /// breadcrumb operators get if they wire this in production by
+    /// accident.
+    async fn verify_with_pubkey(
+        &self,
+        quote: &[u8],
+        options: &VerifyOptions,
+        _cert_der: &[u8],
+    ) -> Result<VerificationResult, VerifyError> {
+        self.verify(quote, options).await
+    }
 }
 
 #[cfg(test)]
